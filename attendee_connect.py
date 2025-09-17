@@ -28,11 +28,13 @@ import json
 import os
 import sys
 import math
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Dict, Optional
 
 import websockets
+from http import HTTPStatus
 
 from bot import sys as BOT_SYSTEM_PROMPT  # type: ignore
 from io import BytesIO
@@ -264,6 +266,8 @@ class AttendeeAudioWebSocket:
         byteswap_output: bool = False,
         downmix_stereo: bool = False,
         attenuate: float = 1.0,
+        frame_ms: int = 40,
+        pace_realtime: bool = True,
     ) -> None:
         self.voice_agent = voice_agent
         self.expected_sample_rate = expected_sample_rate
@@ -272,6 +276,8 @@ class AttendeeAudioWebSocket:
         self.byteswap_output = byteswap_output
         self.downmix_stereo = downmix_stereo
         self.attenuate = max(0.0, min(attenuate, 1.0))
+        self.frame_ms = max(5, min(frame_ms, 200))
+        self.pace_realtime = pace_realtime
 
     async def handler(self, ws: Any) -> None:
         try:
@@ -334,15 +340,17 @@ class AttendeeAudioWebSocket:
             pcm = attenuate_pcm16_le(pcm, self.attenuate)
             print(f"[AUDIO] Attenuated by {self.attenuate}: len={len(pcm)}")
 
-        # Send in 20 ms frames (recommended for realtime). 16 kHz mono 16-bit => 640 bytes per 20 ms
-        frame_samples = int(sample_rate * 0.02)
+        # Send in configurable frames (default 40 ms). 16 kHz mono 16-bit => 640 bytes per 20 ms
+        frame_samples = int(sample_rate * (self.frame_ms / 1000.0))
         frame_bytes = frame_samples * 2
         total = len(pcm)
         if frame_bytes <= 0:
-            frame_bytes = 640 if sample_rate == 16000 else 960
+            # Fallback to 20 ms
+            frame_bytes = (int(sample_rate * 0.02)) * 2
         num_frames = (total + frame_bytes - 1) // frame_bytes
         sent = 0
-        print(f"[WS] Sending bot_output in {num_frames} frames (frame_bytes={frame_bytes}, total={total})")
+        print(f"[WS] Sending bot_output in {num_frames} frames (frame_ms={self.frame_ms}, frame_bytes={frame_bytes}, total={total}, pace={self.pace_realtime})")
+        start_time = time.perf_counter()
         for i in range(0, total, frame_bytes):
             frame = pcm[i : i + frame_bytes]
             if not frame:
@@ -358,7 +366,13 @@ class AttendeeAudioWebSocket:
             await ws.send(json.dumps(msg))
             sent += len(frame)
             # Pace the stream to ~real-time
-            await asyncio.sleep(0.02)
+            if self.pace_realtime:
+                # Target time from start for next frame
+                target_s = (i + frame_bytes) / (sample_rate * 2)  # bytes -> seconds
+                now = time.perf_counter() - start_time
+                delay = target_s - now
+                if delay > 0:
+                    await asyncio.sleep(delay)
         print(f"[WS] Completed send: {sent} bytes over {num_frames} frames at {sample_rate} Hz")
 
 
@@ -367,7 +381,19 @@ async def run_audio_server(host: str = "0.0.0.0", port: int = 8765):
     # Runtime flags are injected when constructing this in main(); this default is used when called directly
     attendee_ws = AttendeeAudioWebSocket(voice_agent)
     print(f"[WS] Starting server on ws://{host}:{port}/attendee-websocket")
-    return await websockets.serve(attendee_ws.handler, host, port, ping_interval=20, ping_timeout=20)
+    return await websockets.serve(attendee_ws.handler, host, port, ping_interval=20, ping_timeout=20, process_request=_http_health_or_path)
+
+
+async def _http_health_or_path(path: str, request_headers: Any):
+    # If it's not a websocket upgrade, respond 200 OK for health checks
+    upgrade = (request_headers.get("Upgrade") or "").lower()
+    if upgrade != "websocket":
+        body = b"OK\n"
+        return HTTPStatus.OK, [("Content-Type", "text/plain"), ("Content-Length", str(len(body)))], body
+    # Enforce path
+    if path != "/attendee-websocket":
+        body = b"Not Found\n"
+        return HTTPStatus.NOT_FOUND, [("Content-Type", "text/plain"), ("Content-Length", str(len(body)))], body
 
 
 def generate_sine_pcm16(sample_rate: int, freq_hz: float, duration_ms: int, amplitude: float = 0.5) -> bytes:
