@@ -28,6 +28,11 @@ import urllib.error
 from dotenv import load_dotenv
 from elevenlabs import VoiceSettings  # type: ignore
 from elevenlabs.client import ElevenLabs  # type: ignore
+from bot import sys as BOT_SYSTEM_PROMPT  # type: ignore
+from pipecat.transcriptions.language import Language  # type: ignore
+from pipecat.services.openai.llm import OpenAILLMService  # type: ignore
+from pipecat.services.elevenlabs.tts import ElevenLabsTTSService  # type: ignore
+from pipecat.services.soniox.stt import SonioxSTTService, SonioxInputParams  # type: ignore
 
 
 load_dotenv(override=True)
@@ -107,6 +112,7 @@ class VoiceBridgeServer:
         self.frame_ms = frame_ms
         self.pace = pace
         self.responded_once = False
+        self._in_pcm = bytearray()
 
     async def handler(self, ws: Any) -> None:
         print("[Bridge] Client connected")
@@ -127,11 +133,31 @@ class VoiceBridgeServer:
                 continue
             if payload.get("trigger") != "realtime_audio.mixed":
                 continue
-            if not self.responded_once:
+            # Accumulate incoming audio
+            data = payload.get("data", {})
+            chunk_b64 = data.get("chunk")
+            try:
+                chunk = base64.b64decode(chunk_b64) if chunk_b64 else b""
+            except Exception:
+                chunk = b""
+            if chunk:
+                self._in_pcm.extend(chunk)
+            # Simple trigger: when > 0.8s accumulated and we haven't responded yet
+            if not self.responded_once and len(self._in_pcm) >= int(self.sample_rate * 2 * 0.8):
                 self.responded_once = True
-                text = "[cheerfully] Hola Julián, soy Gonzalo de TEOS. ¿Cómo estás?"
-                pcm, sr = await self.engine.tts_pcm(text)
-                await self._send_pcm(ws, pcm, sr)
+                input_pcm = bytes(self._in_pcm)
+                self._in_pcm.clear()
+                try:
+                    if hasattr(self.engine, "stt_llm_tts"):
+                        out_pcm, out_sr = await self.engine.stt_llm_tts(input_pcm, self.sample_rate)
+                        if out_pcm:
+                            await self._send_pcm(ws, out_pcm, out_sr)
+                    else:
+                        text = "[cheerfully] Hola Julián, soy Gonzalo de TEOS. ¿Cómo estás?"
+                        pcm, sr = await self.engine.tts_pcm(text)
+                        await self._send_pcm(ws, pcm, sr)
+                except Exception as e:
+                    print(f"[Bridge] STT/LLM/TTS failed: {e}")
 
     async def _send_pcm(self, ws: Any, pcm: bytes, sample_rate: int) -> None:
         frame_samples = int(sample_rate * (self.frame_ms / 1000.0))
@@ -160,7 +186,7 @@ class VoiceBridgeServer:
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Run voice bridge WebSocket server")
-    parser.add_argument("--engine", default="elevenlabs", choices=["elevenlabs"], help="Voice engine")
+    parser.add_argument("--engine", default="elevenlabs", choices=["elevenlabs", "pipecat"], help="Voice engine")
     parser.add_argument("--sample-rate", type=int, default=16000, choices=[8000, 16000, 24000])
     parser.add_argument("--frame-ms", type=int, default=40)
     parser.add_argument("--no-pace", action="store_true")
@@ -170,6 +196,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.engine == "elevenlabs":
         engine = ElevenLabsEngine(args.sample_rate)
+    elif args.engine == "pipecat":
+        engine = PipecatStackEngine(args.sample_rate)
     else:
         raise SystemExit("Unsupported engine")
 
