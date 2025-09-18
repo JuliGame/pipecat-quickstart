@@ -3,6 +3,7 @@
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
+# uv run python bot.py -t webrtc
 
 """Pipecat Quickstart Example.
 
@@ -124,7 +125,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         )
     )
 
-    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4.1-nano")
+    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4.1")
 
     messages = [
         {
