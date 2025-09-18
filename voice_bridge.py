@@ -12,6 +12,14 @@ Usage:
 Then separately, create or reuse the Attendee bot with `attendee_manage.py` pointing to the WS URL.
 """
 
+# Expected behavior:
+# Every time you stop speaking (or press ‘l’), the bot should generate a reply and you should hear it spoken once, clearly, in the meeting.
+# Pressing ‘t’ should always play a short spoken test.
+# This should repeat reliably on every turn.
+# The problem:
+# After the first reply, your turns weren’t being treated as complete messages, so the bot didn’t start speaking again.
+# The system wasn’t consistently recognizing “this is a new reply to speak,” so no audio was sent on later turns, even though text was generated.
+
 import argparse
 import asyncio
 import base64
@@ -532,14 +540,16 @@ if _HAS_PIPECAT:
                     super().__init__(name=name)
                     self._buffer: str = ""
                     self._debounce: Any | None = None
+                    self._emitted_in_run: bool = False
 
                 async def _finalize_and_speak(self) -> None:
                     try:
                         text = self._buffer.strip()
                         self._buffer = ""
-                        if text:
+                        if text and not self._emitted_in_run:
                             print(f"[PipecatDebug] LLM→TTS: finalized len={len(text)}")
                             await self.push_frame(TTSSpeakFrame(text))
+                            self._emitted_in_run = True
                     except Exception:
                         pass
                 async def process_frame(self, frame: Any, direction: Any) -> None:
@@ -552,11 +562,25 @@ if _HAS_PIPECAT:
                     # Bridge plain LLM text to TTS speak
                     try:
                         fname = type(frame).__name__
+                        # Reset run state on new LLM run
+                        if isinstance(frame, LLMRunFrame):
+                            try:
+                                if self._debounce is not None:
+                                    self._debounce.cancel()
+                            except Exception:
+                                pass
+                            self._buffer = ""
+                            self._emitted_in_run = False
+                            return
+
                         # Accumulate streaming deltas, then speak once after a brief pause
                         if isinstance(frame, LLMTextFrame):
                             delta = str(getattr(frame, "text", "") or "")
                             if delta:
                                 print(f"[PipecatDebug] LLM→TTS: delta len={len(delta)}")
+                                # If starting a new chunk sequence, allow a new emission
+                                if not self._buffer:
+                                    self._emitted_in_run = False
                                 self._buffer += delta
                                 # debounce finalize
                                 try:
@@ -571,7 +595,7 @@ if _HAS_PIPECAT:
                                             await self._finalize_and_speak()
                                         except asyncio.CancelledError:
                                             return
-                                    self._debounce = self.create_task(_debounced(), name="llm-tts-debounce")
+                                    self._debounce = asyncio.create_task(_debounced())
                                 except Exception:
                                     pass
                             return
@@ -594,11 +618,13 @@ if _HAS_PIPECAT:
                                                 self._debounce.cancel()
                                         except Exception:
                                             pass
-                                        if self._buffer.strip():
-                                            self._buffer += " " + content.strip()
-                                            await self._finalize_and_speak()
-                                        else:
-                                            await self.push_frame(TTSSpeakFrame(content.strip()))
+                                        if not self._emitted_in_run:
+                                            if self._buffer.strip():
+                                                self._buffer += " " + content.strip()
+                                                await self._finalize_and_speak()
+                                            else:
+                                                await self.push_frame(TTSSpeakFrame(content.strip()))
+                                            self._emitted_in_run = True
                                         break
                         # Fallback: ignore non-final frames to avoid spamming TTS
                     except Exception:
