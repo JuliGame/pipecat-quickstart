@@ -56,7 +56,9 @@ def get_base_url() -> str:
 
 def get_api_key() -> str:
     # Fallback to user-provided key if env not set
-    return read_env("ATTENDEE_API_KEY", "oHvfwfR4knQHINXkTp8qJDFLwWghjh7r") or ""
+    key = read_env("ATTENDEE_API_KEY", "oHvfwfR4knQHINXkTp8qJDFLwWghjh7r") or ""
+    print(f"[ATTENDEE] API key: {key}")
+    return key
 
 
 def build_request(method: str, url: str, api_key: str, data: Optional[Dict[str, Any]] = None) -> urllib.request.Request:
@@ -502,6 +504,7 @@ def main(argv: Any = None) -> int:
     parser.add_argument("--byteswap", action="store_true", help="Byteswap 16-bit samples before sending")
     parser.add_argument("--downmix-stereo", action="store_true", help="Downmix stereo 16-bit PCM to mono before sending")
     parser.add_argument("--attenuate", type=float, default=1.0, help="Scale PCM amplitude (0.0-1.0)")
+    parser.add_argument("--create-only", action="store_true", help="Only create the Attendee bot; do not start a local WS server (use when voice_bridge.py is running)")
     args = parser.parse_args(argv)
 
     if not args.meeting_url:
@@ -515,22 +518,26 @@ def main(argv: Any = None) -> int:
         return 2
 
     print(f"Using Attendee at: {base_url}")
-    print("Starting local WebSocket server for realtime audio on ws://0.0.0.0:8765/attendee-websocket ...")
+    if not args.create_only:
+        print("Starting local WebSocket server for realtime audio on ws://0.0.0.0:8765/attendee-websocket ...")
 
     async def orchestrate() -> int:
-        # Build server with runtime flags
-        voice_agent = SimpleVoiceAgent()
-        attendee_ws = AttendeeAudioWebSocket(
-            voice_agent,
-            expected_sample_rate=16000,
-            send_test_tone_ms=args.test_tone_ms,
-            byteswap_output=args.byteswap,
-            downmix_stereo=args.downmix_stereo,
-            attenuate=args.attenuate,
-        )
-        print(f"[CFG] test_tone_ms={args.test_tone_ms} byteswap={args.byteswap} downmix_stereo={args.downmix_stereo} attenuate={args.attenuate}")
-        server = await websockets.serve(attendee_ws.handler, "0.0.0.0", 8765, ping_interval=20, ping_timeout=20)
+        server = None
         try:
+            if not args.create_only:
+                # Build server with runtime flags
+                voice_agent = SimpleVoiceAgent()
+                attendee_ws = AttendeeAudioWebSocket(
+                    voice_agent,
+                    expected_sample_rate=16000,
+                    send_test_tone_ms=args.test_tone_ms,
+                    byteswap_output=args.byteswap,
+                    downmix_stereo=args.downmix_stereo,
+                    attenuate=args.attenuate,
+                )
+                print(f"[CFG] test_tone_ms={args.test_tone_ms} byteswap={args.byteswap} downmix_stereo={args.downmix_stereo} attenuate={args.attenuate}")
+                server = await websockets.serve(attendee_ws.handler, "0.0.0.0", 8765, ping_interval=20, ping_timeout=20)
+
             print("Creating Attendee bot...")
             bot = create_attendee_bot(args.meeting_url, args.bot_name, api_key, sample_rate=16000)
             bot_id = bot.get("id")
@@ -538,13 +545,17 @@ def main(argv: Any = None) -> int:
                 print(f"Unexpected create-bot response: {bot}", file=sys.stderr)
                 return 1
             print(f"Created bot id: {bot_id}")
+            if args.create_only:
+                print("Bot created. voice_bridge.py should receive the WebSocket connection shortly.")
+                return 0
             print("Waiting for Attendee to stream audio to our WebSocket...")
             await asyncio.Future()
         except asyncio.CancelledError:
             return 0
         finally:
-            server.close()
-            await server.wait_closed()
+            if server is not None:
+                server.close()
+                await server.wait_closed()
         return 0
 
     try:

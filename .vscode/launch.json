@@ -1,0 +1,31 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Voice Bridge: Launch (monitor, no greet)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/voice_bridge.py",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "envFile": "${workspaceFolder}/.env",
+      "args": [
+        "--engine", "elevenlabs",
+        "--frame-ms", "60",
+        "--monitor-input",
+        "--no-greet",
+        "--host", "0.0.0.0",
+        "--port", "8765"
+      ]
+    },
+    {
+      "name": "Voice Bridge: Attach to debugpy",
+      "type": "python",
+      "request": "attach",
+      "connect": { "host": "localhost", "port": 5678 },
+      "justMyCode": false
+    }
+  ]
+}
+
+
