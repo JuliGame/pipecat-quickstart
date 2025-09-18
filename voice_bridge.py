@@ -122,6 +122,122 @@ class ElevenLabsEngine:
             return b"", self.sample_rate
 
 
+def _pcm16le_to_wav_bytes(pcm: bytes, sample_rate: int, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
+    data_size = len(pcm)
+    byte_rate = sample_rate * num_channels * (bits_per_sample // 8)
+    block_align = num_channels * (bits_per_sample // 8)
+    riff_size = 36 + data_size
+    header = bytearray()
+    header += b"RIFF"
+    header += riff_size.to_bytes(4, "little")
+    header += b"WAVE"
+    header += b"fmt "
+    header += (16).to_bytes(4, "little")  # fmt chunk size
+    header += (1).to_bytes(2, "little")   # PCM format
+    header += num_channels.to_bytes(2, "little")
+    header += sample_rate.to_bytes(4, "little")
+    header += byte_rate.to_bytes(4, "little")
+    header += block_align.to_bytes(2, "little")
+    header += bits_per_sample.to_bytes(2, "little")
+    header += b"data"
+    header += data_size.to_bytes(4, "little")
+    return bytes(header) + pcm
+
+
+def _http_multipart_openai_transcribe(wav_bytes: bytes, api_key: str, model: str = "whisper-1") -> str:
+    boundary = f"----WebKitFormBoundary{int(time.time()*1000)}"
+    crlf = "\r\n"
+    parts: list[bytes] = []
+    # model field
+    parts.append((
+        f"--{boundary}{crlf}Content-Disposition: form-data; name=\"model\"{crlf}{crlf}{model}{crlf}".encode("utf-8")
+    ))
+    # file field
+    parts.append((
+        f"--{boundary}{crlf}Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"{crlf}Content-Type: audio/wav{crlf}{crlf}".encode("utf-8")
+    ))
+    parts.append(wav_bytes)
+    parts.append(crlf.encode("utf-8"))
+    # end
+    parts.append((f"--{boundary}--{crlf}".encode("utf-8")))
+    body = b"".join(parts)
+    req = urllib.request.Request(
+        url="https://api.openai.com/v1/audio/transcriptions",
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+    )
+    with urllib.request.urlopen(req) as resp:
+        raw = resp.read().decode("utf-8")
+        try:
+            data = json.loads(raw)
+            # OpenAI returns { text: "..." }
+            return (data.get("text") or "").strip()
+        except Exception:
+            return ""
+
+
+def _openai_chat_complete(messages: list[dict[str, str]], model: str = "gpt-4.1", max_tokens: int = 90, temperature: float = 0.6) -> str:
+    api_key = os.getenv("OPENAI_API_KEY") or ""
+    if not api_key:
+        return "[cheerfully] Hola, ¿cómo estás?"
+    req = urllib.request.Request(
+        url="https://api.openai.com/v1/chat/completions",
+        data=json.dumps({
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data["choices"][0]["message"]["content"].strip()
+    except Exception:
+        return "[cheerfully] Hola, ¿cómo estás?"
+
+
+class PipecatStackEngine:
+    def __init__(self, sample_rate: int) -> None:
+        self.sample_rate = sample_rate
+        self._tts = ElevenLabsEngine(sample_rate)
+
+    async def stt_llm_tts(self, pcm16le: bytes, in_sample_rate: int) -> tuple[bytes, int]:
+        try:
+            # 1) STT via OpenAI Whisper on WAV
+            wav = _pcm16le_to_wav_bytes(pcm16le, in_sample_rate)
+            openai_key = os.getenv("OPENAI_API_KEY") or ""
+            text = _http_multipart_openai_transcribe(wav, openai_key)
+            if not text:
+                print("[Pipecat] STT returned empty text")
+                return b"", self.sample_rate
+            print(f"[Pipecat] STT: {text}")
+            # 2) LLM with Spanish system prompt
+            system_prompt = (
+                "Eres Gonzalo, un vendedor amable de TEOS. Hablas en español con acentuación correcta. "
+                "Responde breve y conversacional, sin listas ni emojis."
+            )
+            reply = _openai_chat_complete([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text},
+            ])
+            print(f"[Pipecat] LLM: {reply}")
+            # 3) TTS via ElevenLabs
+            pcm, sr = await self._tts.tts_pcm(reply)
+            return pcm, sr
+        except Exception as e:
+            print(f"[Pipecat] Pipeline error: {e}")
+            return b"", self.sample_rate
+
 def _monitor_device_and_beep(sample_rate: int) -> None:
     if not sa:
         print("[Bridge:Monitor] simpleaudio not available; skipping test tone")
@@ -250,14 +366,16 @@ class VoiceBridgeServer:
         if self.bot_tone_hz > 0 and self._tone_task is None:
             self._tone_task = asyncio.create_task(self._tone_loop(ws))
         # Proactively greet on connect to ensure audio output even without incoming audio
-        if self.greet_enabled and not self.responded_once:
+        if self.greet_enabled and not self.responded_once and hasattr(self.engine, "tts_pcm"):
             try:
-                self.responded_once = True
-                text = "Hola Julián, soy Gonzalo de TEOS. ¿Cómo estás? aguanten los sanguches, mi nombre es gabriel, abud, abud, abud, nazi"
-                pcm, sr = await self.engine.tts_pcm(text)
+                text = "[cheerfully] Hola Julián, soy Gonzalo de TEOS. ¿Cómo estás?"
+                pcm, sr = await self.engine.tts_pcm(text)  # type: ignore[attr-defined]
                 await self._send_pcm(ws, pcm, sr)
+                self.responded_once = True
             except Exception as e:
                 print(f"[Bridge] Initial greet failed: {e}")
+        elif self.greet_enabled and not hasattr(self.engine, "tts_pcm"):
+            print("[Bridge] Greeting skipped: current engine has no tts_pcm")
 
         try:
             async for message in ws:
@@ -319,7 +437,7 @@ class VoiceBridgeServer:
                                 # Do not disrupt the bridge on playback errors
                                 print(f"[Bridge:Monitor] playback error: {e}")
                 # Simple trigger: when > 0.8s accumulated and we haven't responded yet
-                if self.greet_enabled and not self.responded_once and len(self._in_pcm) >= int(self.sample_rate * 2 * 0.8):
+                if not self.responded_once and len(self._in_pcm) >= int(self.sample_rate * 2 * 0.8):
                     self.responded_once = True
                     input_pcm = bytes(self._in_pcm)
                     self._in_pcm.clear()
