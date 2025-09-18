@@ -39,8 +39,13 @@ try:
         OutputAudioRawFrame,
         TTSAudioRawFrame,
         SpeechOutputAudioRawFrame,
+        InterimTranscriptionFrame,
         StartFrame,
         LLMRunFrame,
+        LLMTextFrame,
+        TTSSpeakFrame,
+        TTSStartedFrame,
+        TTSStoppedFrame,
     )
     from pipecat.pipeline.pipeline import Pipeline
     from pipecat.pipeline.runner import PipelineRunner
@@ -278,10 +283,12 @@ if _HAS_PIPECAT:
             if isinstance(frame, StartFrame):
                 try:
                     self._started_event.set()
+                    print("[PipecatDebug] InputProcessor: StartFrame received; started_event set")
                 except Exception:
                     pass
             # Transparently forward all frames downstream
             try:
+                # print(f"[PipecatDebug] InputProcessor forwarding frame: {getattr(frame, 'name', type(frame).__name__)}")
                 await self.push_frame(frame, direction)
             except Exception:
                 pass
@@ -290,10 +297,43 @@ if _HAS_PIPECAT:
             await self._started_event.wait()
 
     class _AttendeeOutputProcessor(FrameProcessor):
-        def __init__(self, sender_cb: Any, started_event: asyncio.Event, *, name: Optional[str] = None) -> None:
+        def __init__(self, sender_cb: Any, started_event: asyncio.Event, expected_sr: int, *, name: Optional[str] = None) -> None:
             super().__init__(name=name)
             self._sender_cb = sender_cb
             self._started_event = started_event
+            self._expected_sr = int(expected_sr)
+
+        def _resample_linear(self, pcm: bytes, src_sr: int, dst_sr: int) -> bytes:
+            if src_sr == dst_sr or len(pcm) < 2:
+                return pcm
+            # 16-bit mono little-endian
+            import math
+            num_src = len(pcm) // 2
+            # Convert to ints
+            src = memoryview(pcm)
+            def read_sample(idx: int) -> int:
+                i = idx * 2
+                s = src[i] | (src[i+1] << 8)
+                if s >= 32768:
+                    s -= 65536
+                return s
+            ratio = float(src_sr) / float(dst_sr)
+            num_dst = max(1, int(num_src / ratio))
+            out = bytearray(num_dst * 2)
+            for n in range(num_dst):
+                pos = n * ratio
+                i0 = int(math.floor(pos))
+                i1 = min(i0 + 1, num_src - 1)
+                frac = pos - i0
+                s0 = read_sample(i0)
+                s1 = read_sample(i1)
+                s = int((1.0 - frac) * s0 + frac * s1)
+                if s < 0:
+                    s += 65536
+                j = n * 2
+                out[j] = s & 0xFF
+                out[j+1] = (s >> 8) & 0xFF
+            return bytes(out)
 
         async def process_frame(self, frame: Any, direction: Any) -> None:
             await super().process_frame(frame, direction)
@@ -301,27 +341,48 @@ if _HAS_PIPECAT:
                 if isinstance(frame, StartFrame):
                     try:
                         self._started_event.set()
+                        print("[PipecatDebug] OutputProcessor: StartFrame received; pipeline_started set")
                     except Exception:
                         pass
                 if isinstance(frame, (OutputAudioRawFrame, TTSAudioRawFrame, SpeechOutputAudioRawFrame)):
                     # Send PCM bytes back via provided callback
                     if callable(self._sender_cb):
-                        await self._sender_cb(frame.audio, frame.sample_rate)
+                        audio = frame.audio
+                        sr = int(getattr(frame, "sample_rate", self._expected_sr) or self._expected_sr)
+                        try:
+                            size = len(audio) if isinstance(audio, (bytes, bytearray, memoryview)) else 0
+                            print(f"[PipecatDebug] OutputProcessor: audio frame type={type(frame).__name__} bytes={size} sr={sr}")
+                        except Exception:
+                            pass
+                        if sr != self._expected_sr:
+                            try:
+                                audio = self._resample_linear(audio, sr, self._expected_sr)
+                                sr = self._expected_sr
+                            except Exception as e:
+                                print(f"[PipecatDebug] OutputProcessor: resample error: {e}")
+                        # Ensure even bytes
+                        if len(audio) % 2 != 0:
+                            audio = audio[:-1]
+                        try:
+                            await self._sender_cb(audio, sr)
+                        except Exception as e:
+                            print(f"[PipecatDebug] OutputProcessor: sender_cb error: {e}")
             except Exception as e:
                 print(f"[PipecatTransport] Output send error: {e}")
             # Transparently forward all frames downstream
             try:
+                # print(f"[PipecatDebug] OutputProcessor forwarding frame: {getattr(frame, 'name', type(frame).__name__)}")
                 await self.push_frame(frame, direction)
             except Exception:
                 pass
 
     class AttendeeBridgeTransport(BaseTransport):
-        def __init__(self) -> None:
+        def __init__(self, expected_sr: int) -> None:
             super().__init__(name="AttendeeBridgeTransport")
             self._sender_cb: Any = None
             self._input_proc = _AttendeeInputProcessor(name="attendee-input")
             self._pipeline_started: asyncio.Event = asyncio.Event()
-            self._output_proc = _AttendeeOutputProcessor(self._send_out, self._pipeline_started, name="attendee-output")
+            self._output_proc = _AttendeeOutputProcessor(self._send_out, self._pipeline_started, expected_sr, name="attendee-output")
             self._buffer: list[tuple[bytes, int, int]] = []
 
         def input(self) -> FrameProcessor:
@@ -332,9 +393,11 @@ if _HAS_PIPECAT:
 
         def set_sender(self, sender_cb: Any) -> None:
             self._sender_cb = sender_cb
+            # print("[PipecatDebug] Transport: sender callback set")
 
         async def _send_out(self, audio: bytes, sample_rate: int) -> None:
             if callable(self._sender_cb):
+                # print(f"[PipecatDebug] Transport._send_out: len={len(audio)} sr={sample_rate}")
                 await self._sender_cb(audio, sample_rate)
 
         async def feed_pcm(self, pcm: bytes, sample_rate: int, num_channels: int = 1) -> None:
@@ -347,9 +410,11 @@ if _HAS_PIPECAT:
 
         async def wait_started(self) -> None:
             await self._input_proc.wait_started()
+            print("[PipecatDebug] Transport: input started")
 
         async def wait_pipeline_started(self) -> None:
             await self._pipeline_started.wait()
+            print("[PipecatDebug] Transport: pipeline started")
 
         async def flush_buffer(self) -> None:
             if not self._buffer:
@@ -363,7 +428,7 @@ if _HAS_PIPECAT:
     class PipecatPipelineEngine:
         def __init__(self, sample_rate: int) -> None:
             self.sample_rate = sample_rate
-            self.transport = AttendeeBridgeTransport()
+            self.transport = AttendeeBridgeTransport(expected_sr=sample_rate)
             self._runner: Any = None
             self._task: Any = None
             # Persona/context matching bot.py
@@ -385,11 +450,11 @@ if _HAS_PIPECAT:
             )
             llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4.1")
             _el_api_key = cast(str, os.getenv("ELEVENLABS_API_KEY") or "")
-            _el_voice_id = cast(str, os.getenv("ELEVENLABS_VOICE_ID") or "")
+            _el_voice_id = cast(str, os.getenv("ELEVENLABS_VOICE_ID") or "pNInz6obpgDQGcFmaJgB")
             tts = ElevenLabsTTSService(
                 api_key=_el_api_key,
                 voice_id=_el_voice_id,
-                model="eleven_multilingual_v2",
+                model="eleven_flash_v2_5",
                 params=ElevenLabsTTSService.InputParams(
                     language=Language.ES,
                     stability=0.7,
@@ -408,13 +473,148 @@ if _HAS_PIPECAT:
 
             rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
 
+            class _SmartTurnEmulator(FrameProcessor):
+                def __init__(self, stop_secs: float = 0.8, *, name: Optional[str] = None) -> None:
+                    super().__init__(name=name)
+                    self._stop_secs = float(max(0.2, stop_secs))
+                    self._last_activity: float | None = None
+                    self._watch_task: Any | None = None
+                    self._speaking = False
+
+                async def process_frame(self, frame: Any, direction: Any) -> None:
+                    await super().process_frame(frame, direction)
+                    try:
+                        # Forward original frame downstream
+                        await self.push_frame(frame, direction)
+                    except Exception:
+                        pass
+                    try:
+                        # Start watchdog when pipeline starts
+                        if isinstance(frame, StartFrame) and self._watch_task is None:
+                            self._watch_task = self.create_task(self._watchdog(), name="smartturn-watchdog")
+                            print(f"[PipecatDebug] SmartTurn: watchdog started stop_secs={self._stop_secs}")
+                        # Track interim transcription activity
+                        if isinstance(frame, InterimTranscriptionFrame):
+                            text = str(getattr(frame, "text", "") or "").strip()
+                            is_final = bool(getattr(frame, "is_final", False) or getattr(frame, "final", False))
+                            now = time.monotonic()
+                            if text:
+                                self._last_activity = now
+                                self._speaking = True
+                            if is_final and text:
+                                # If the STT marks final explicitly, trigger immediately
+                                await self.push_frame(LLMRunFrame())
+                                self._speaking = False
+                                self._last_activity = None
+                    except Exception:
+                        pass
+
+                async def _watchdog(self) -> None:
+                    try:
+                        while True:
+                            await asyncio.sleep(0.05)
+                            if self._speaking and self._last_activity is not None:
+                                elapsed = time.monotonic() - self._last_activity
+                                if elapsed >= self._stop_secs:
+                                    try:
+                                        await self.push_frame(LLMRunFrame())
+                                    except Exception:
+                                        pass
+                                    self._speaking = False
+                                    self._last_activity = None
+                    except asyncio.CancelledError:
+                        return
+
+            smart_turn = _SmartTurnEmulator(stop_secs=0.8, name="smart-turn")
+
+            class _LLMToTTSSpeak(FrameProcessor):
+                def __init__(self, *, name: Optional[str] = None) -> None:
+                    super().__init__(name=name)
+                    self._buffer: str = ""
+                    self._debounce: Any | None = None
+
+                async def _finalize_and_speak(self) -> None:
+                    try:
+                        text = self._buffer.strip()
+                        self._buffer = ""
+                        if text:
+                            print(f"[PipecatDebug] LLM→TTS: finalized len={len(text)}")
+                            await self.push_frame(TTSSpeakFrame(text))
+                    except Exception:
+                        pass
+                async def process_frame(self, frame: Any, direction: Any) -> None:
+                    await super().process_frame(frame, direction)
+                    # Forward original frame
+                    try:
+                        await self.push_frame(frame, direction)
+                    except Exception:
+                        pass
+                    # Bridge plain LLM text to TTS speak
+                    try:
+                        fname = type(frame).__name__
+                        # Accumulate streaming deltas, then speak once after a brief pause
+                        if isinstance(frame, LLMTextFrame):
+                            delta = str(getattr(frame, "text", "") or "")
+                            if delta:
+                                print(f"[PipecatDebug] LLM→TTS: delta len={len(delta)}")
+                                self._buffer += delta
+                                # debounce finalize
+                                try:
+                                    if self._debounce is not None:
+                                        self._debounce.cancel()
+                                except Exception:
+                                    pass
+                                try:
+                                    async def _debounced() -> None:
+                                        try:
+                                            await asyncio.sleep(0.25)
+                                            await self._finalize_and_speak()
+                                        except asyncio.CancelledError:
+                                            return
+                                    self._debounce = self.create_task(_debounced(), name="llm-tts-debounce")
+                                except Exception:
+                                    pass
+                            return
+
+                        # Do not trigger TTS on non-final tokens beyond the accumulator
+                        # Some LLMs may emit message frames instead of LLMTextFrame
+                        # Try to extract assistant text from LLMMessages* frames
+                        if fname in ("LLMMessagesFrame", "LLMMessagesAppendFrame", "LLMMessagesUpdateFrame"):
+                            messages = getattr(frame, "messages", None)
+                            if isinstance(messages, (list, tuple)) and messages:
+                                # Find last assistant content
+                                for m in reversed(messages):
+                                    role = (m.get("role") if isinstance(m, dict) else None) or ""
+                                    content = m.get("content") if isinstance(m, dict) else None
+                                    if role == "assistant" and isinstance(content, str) and content.strip():
+                                        print(f"[PipecatDebug] LLM→TTS: assistant message len={len(content.strip())}")
+                                        # Cancel pending debounce and flush buffer
+                                        try:
+                                            if self._debounce is not None:
+                                                self._debounce.cancel()
+                                        except Exception:
+                                            pass
+                                        if self._buffer.strip():
+                                            self._buffer += " " + content.strip()
+                                            await self._finalize_and_speak()
+                                        else:
+                                            await self.push_frame(TTSSpeakFrame(content.strip()))
+                                        break
+                        # Fallback: ignore non-final frames to avoid spamming TTS
+                    except Exception:
+                        pass
+
+            llm_to_tts = _LLMToTTSSpeak(name="llm-to-tts")
+
             pipeline = Pipeline(
                 [
                     self.transport.input(),
                     rtvi,
                     stt,
+                    smart_turn,
                     context_agg.user(),
                     llm,
+                    llm_to_tts,
                     tts,
                     self.transport.output(),
                     context_agg.assistant(),
@@ -442,11 +642,11 @@ if _HAS_PIPECAT:
                 await self.transport.wait_pipeline_started()
             except Exception:
                 pass
-            # Flush any buffered input
             try:
                 await self.transport.flush_buffer()
             except Exception:
                 pass
+            print("[PipecatDebug] Engine: pipeline started and ready")
 
         async def stop(self) -> None:
             try:
@@ -511,7 +711,7 @@ def _monitor_device_and_beep(sample_rate: int) -> None:
 
 
 class VoiceBridgeServer:
-    def __init__(self, engine: Any, sample_rate: int, frame_ms: int, pace: bool, monitor_input: bool, greet_enabled: bool, bot_beep_on_connect: bool = False, bot_tone_hz: int = 0, log_latency: bool = False) -> None:
+    def __init__(self, engine: Any, sample_rate: int, frame_ms: int, pace: bool, monitor_input: bool, greet_enabled: bool, bot_beep_on_connect: bool = False, bot_tone_hz: int = 0, log_latency: bool = False, debug_trigger: bool = False) -> None:
         self.engine = engine
         self.sample_rate = sample_rate
         self.frame_ms = frame_ms
@@ -521,6 +721,7 @@ class VoiceBridgeServer:
         self.bot_beep_on_connect = bot_beep_on_connect
         self.bot_tone_hz = max(0, int(bot_tone_hz))
         self.log_latency = log_latency
+        self.debug_trigger = debug_trigger
         self.responded_once = False
         self._in_pcm = bytearray()
         self._chunks_received = 0
@@ -576,6 +777,88 @@ class VoiceBridgeServer:
 
     async def handler(self, ws: Any) -> None:
         print("[Bridge] Client connected")
+        # Optional: start debug key trigger loop to bypass VAD/Smart Turn
+        debug_stop_event: Any = None
+        debug_thread: Any = None
+        if self.debug_trigger:
+            try:
+                loop = asyncio.get_running_loop()
+                debug_stop_event = threading.Event()
+                def _debug_key_loop() -> None:
+                    try:
+                        try:
+                            import msvcrt  # type: ignore
+                            _has_msvcrt = True
+                        except Exception:
+                            _has_msvcrt = False
+                        print("[Bridge:Debug] Press 't' for direct TTS test, 'l' to trigger LLM turn, 'q' to stop debug loop")
+                        while not debug_stop_event.is_set():
+                            ch: str | None = None
+                            if _has_msvcrt:
+                                if msvcrt.kbhit():  # type: ignore
+                                    b = msvcrt.getch()  # type: ignore
+                                    try:
+                                        ch = b.decode('utf-8', errors='ignore').lower()
+                                    except Exception:
+                                        ch = None
+                                else:
+                                    time.sleep(0.05)
+                                    continue
+                            else:
+                                # Fallback (blocking); avoid spinning if not Windows
+                                ch = sys.stdin.read(1).lower()
+                            if not ch:
+                                continue
+                            if ch == 'q':
+                                print("[Bridge:Debug] Stopping debug key loop")
+                                break
+                            if ch == 't':
+                                print("[Bridge:Debug] Direct TTS test trigger (always using ElevenLabsEngine)")
+                                def _do_tts() -> Any:
+                                    async def _coro() -> None:
+                                        try:
+                                            text = "[debug] Hola, esto es una prueba de TTS."
+                                            try:
+                                                direct = ElevenLabsEngine(self.sample_rate)
+                                                pcm, sr = await direct.tts_pcm(text)
+                                                await self._send_pcm(ws, pcm, sr)
+                                            except Exception as e2:
+                                                print(f"[Bridge:Debug] Direct ElevenLabs error: {e2}")
+                                        except Exception as e:
+                                            print(f"[Bridge:Debug] TTS trigger error: {e}")
+                                    return asyncio.run_coroutine_threadsafe(_coro(), loop)
+                                _do_tts()
+                            if ch == 'T':
+                                print("[Bridge:Debug] Bypass pipeline: ElevenLabsEngine direct TTS")
+                                def _do_direct() -> Any:
+                                    async def _coro2() -> None:
+                                        try:
+                                            text = "[debug-direct] Esto es TTS directo por ElevenLabs."
+                                            try:
+                                                direct = ElevenLabsEngine(self.sample_rate)
+                                                pcm, sr = await direct.tts_pcm(text)
+                                                await self._send_pcm(ws, pcm, sr)
+                                            except Exception as e2:
+                                                print(f"[Bridge:Debug] Direct ElevenLabs error: {e2}")
+                                        except Exception as e:
+                                            print(f"[Bridge:Debug] Direct trigger error: {e}")
+                                    return asyncio.run_coroutine_threadsafe(_coro2(), loop)
+                                _do_direct()
+                            if ch == 'l':
+                                print("[Bridge:Debug] LLM turn trigger (LLMRunFrame)")
+                                if _HAS_PIPECAT and isinstance(self.engine, PipecatPipelineEngine) and self.engine._task is not None:
+                                    try:
+                                        asyncio.run_coroutine_threadsafe(self.engine._task.queue_frames([LLMRunFrame()]), loop)
+                                    except Exception as e:
+                                        print(f"[Bridge:Debug] LLM trigger error: {e}")
+                                else:
+                                    print("[Bridge:Debug] LLM trigger requires PipecatPipelineEngine")
+                    except Exception as e:
+                        print(f"[Bridge:Debug] Key loop error: {e}")
+                debug_thread = threading.Thread(target=_debug_key_loop, name="bridge-debug-keys", daemon=True)
+                debug_thread.start()
+            except Exception as e:
+                print(f"[Bridge:Debug] Failed to start key loop: {e}")
         # If monitoring, announce output device and play a short test tone
         if self.monitor_input:
             _monitor_device_and_beep(self.sample_rate)
@@ -712,6 +995,12 @@ class VoiceBridgeServer:
         except Exception as e:
             print(f"[Bridge] Client connection error/closed: {e}")
         finally:
+            # Stop debug key loop
+            try:
+                if debug_stop_event is not None:
+                    debug_stop_event.set()
+            except Exception:
+                pass
             # Stop tone loop
             try:
                 if self._tone_task is not None:
@@ -819,6 +1108,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         parser.add_argument("--bot-beep-on-connect", action="store_true", help="Send a short test beep into the meeting on client connect")
         parser.add_argument("--bot-tone-hz", type=int, default=0, help="Continuously emit a tone into the meeting at this frequency (0=off)")
         parser.add_argument("--log-latency", action="store_true", help="Log arrival latency vs Attendee timestamp_ms to diagnose delay sources")
+        parser.add_argument("--debug-trigger", action="store_true", help="Enable console key triggers: 't' for TTS, 'l' for LLM")
         args = parser.parse_args(argv)
 
         engine: Any
@@ -839,6 +1129,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             bot_beep_on_connect=args.bot_beep_on_connect,
             bot_tone_hz=args.bot_tone_hz,
             log_latency=args.log_latency,
+            debug_trigger=args.debug_trigger,
         )
         # Decide loop mode
         loop_mode = args.loop_mode
