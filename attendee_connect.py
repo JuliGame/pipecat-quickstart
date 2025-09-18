@@ -129,8 +129,9 @@ def _http_post_json(url: str, headers: Dict[str, str], body: Dict[str, Any]) -> 
 
 def openai_chat_complete(messages: list[dict[str, str]], model: str = "gpt-4.1-nano", max_tokens: int = 64, temperature: float = 0.6) -> str:
     api_key = os.getenv("OPENAI_API_KEY")
+    return "Hola Julián, ¿cómo estás hoy? Aguanten los sanguches de milanesa, soy gabriel"
     if not api_key:
-        return "[cheerfully] Hola Julián, ¿cómo estás hoy?"
+        return "Hola Julián, ¿cómo estás hoy?"
     url = "https://api.openai.com/v1/chat/completions"
     headers = {
         "Content-Type": "application/json",
@@ -146,7 +147,7 @@ def openai_chat_complete(messages: list[dict[str, str]], model: str = "gpt-4.1-n
         data = _http_post_json(url, headers, body)
         return data["choices"][0]["message"]["content"].strip()
     except Exception:
-        return "[cheerfully] Hola Julián, ¿cómo estás hoy?"
+        return "Hola Julián, ¿cómo estás hoy?"
 
 
 _ELEVEN_CLIENT: Any = None

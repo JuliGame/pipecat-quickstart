@@ -164,7 +164,7 @@ def _monitor_device_and_beep(sample_rate: int) -> None:
 
 
 class VoiceBridgeServer:
-    def __init__(self, engine: Any, sample_rate: int, frame_ms: int, pace: bool, monitor_input: bool, greet_enabled: bool, bot_beep_on_connect: bool = False, bot_tone_hz: int = 0) -> None:
+    def __init__(self, engine: Any, sample_rate: int, frame_ms: int, pace: bool, monitor_input: bool, greet_enabled: bool, bot_beep_on_connect: bool = False, bot_tone_hz: int = 0, log_latency: bool = False) -> None:
         self.engine = engine
         self.sample_rate = sample_rate
         self.frame_ms = frame_ms
@@ -173,6 +173,7 @@ class VoiceBridgeServer:
         self.greet_enabled = greet_enabled
         self.bot_beep_on_connect = bot_beep_on_connect
         self.bot_tone_hz = max(0, int(bot_tone_hz))
+        self.log_latency = log_latency
         self.responded_once = False
         self._in_pcm = bytearray()
         self._chunks_received = 0
@@ -180,6 +181,8 @@ class VoiceBridgeServer:
         self._sd_stream = None  # type: ignore[var-annotated]
         self._sd_stream_rate: int | None = None
         self._tone_task: Any | None = None
+        self._latency_sum_ms: float = 0.0
+        self._latency_count: int = 0
         if self.monitor_input and sa is None:
             print("[Bridge:Monitor] simpleaudio not available; --monitor-input disabled")
             self.monitor_input = False
@@ -250,7 +253,7 @@ class VoiceBridgeServer:
         if self.greet_enabled and not self.responded_once:
             try:
                 self.responded_once = True
-                text = "[cheerfully] Hola Julián, soy Gonzalo de TEOS. ¿Cómo estás?"
+                text = "Hola Julián, soy Gonzalo de TEOS. ¿Cómo estás? aguanten los sanguches, mi nombre es gabriel, abud, abud, abud, nazi"
                 pcm, sr = await self.engine.tts_pcm(text)
                 await self._send_pcm(ws, pcm, sr)
             except Exception as e:
@@ -268,16 +271,26 @@ class VoiceBridgeServer:
                 data = payload.get("data", {})
                 chunk_b64 = data.get("chunk")
                 in_sr = data.get("sample_rate") or self.sample_rate
+                ts_ms = data.get("timestamp_ms")
                 try:
                     chunk = base64.b64decode(chunk_b64) if chunk_b64 else b""
                 except Exception:
                     chunk = b""
                 if chunk:
+                    if self.log_latency and isinstance(ts_ms, (int, float)):
+                        now_ms = int(time.time() * 1000)
+                        delta_ms = max(0, now_ms - int(ts_ms))
+                        self._latency_sum_ms += float(delta_ms)
+                        self._latency_count += 1
                     self._chunks_received += 1
                     self._bytes_received += len(chunk)
                     if self._chunks_received == 1 or (self._chunks_received % 50 == 0):
                         seconds = self._bytes_received / (2 * in_sr)
-                        print(f"[Bridge] Receiving audio: chunks={self._chunks_received} total={self._bytes_received}B ~{seconds:.2f}s @ {in_sr} Hz")
+                        if self.log_latency and self._latency_count > 0:
+                            avg_ms = self._latency_sum_ms / float(self._latency_count)
+                            print(f"[Bridge] Receiving audio: chunks={self._chunks_received} total={self._bytes_received}B ~{seconds:.2f}s @ {in_sr} Hz | arrival_latency_avg={avg_ms:.1f} ms")
+                        else:
+                            print(f"[Bridge] Receiving audio: chunks={self._chunks_received} total={self._bytes_received}B ~{seconds:.2f}s @ {in_sr} Hz")
                     self._in_pcm.extend(chunk)
                     # Optional: play back what the bot is hearing (local monitoring)
                     if self.monitor_input:
@@ -316,7 +329,7 @@ class VoiceBridgeServer:
                             if out_pcm:
                                 await self._send_pcm(ws, out_pcm, out_sr)
                         else:
-                            text = "[cheerfully] Hola Julián, soy Gonzalo de TEOS. ¿Cómo estás?"
+                            text = "[cheerfully] Hola Julián, soy Gonzalo de TEOS. ¿Cómo estás? aguanten los sanguches, mi nombre es gabriel, abud, abud, abud, nazi"
                             pcm, sr = await self.engine.tts_pcm(text)
                             await self._send_pcm(ws, pcm, sr)
                     except Exception as e:
@@ -423,6 +436,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         parser.add_argument("--loop-mode", choices=["auto", "thread", "asyncio"], default="auto", help="Event loop strategy")
         parser.add_argument("--bot-beep-on-connect", action="store_true", help="Send a short test beep into the meeting on client connect")
         parser.add_argument("--bot-tone-hz", type=int, default=0, help="Continuously emit a tone into the meeting at this frequency (0=off)")
+        parser.add_argument("--log-latency", action="store_true", help="Log arrival latency vs Attendee timestamp_ms to diagnose delay sources")
         args = parser.parse_args(argv)
 
         if args.engine == "elevenlabs":
@@ -441,12 +455,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             not args.no_greet,
             bot_beep_on_connect=args.bot_beep_on_connect,
             bot_tone_hz=args.bot_tone_hz,
+            log_latency=args.log_latency,
         )
         # Decide loop mode
         loop_mode = args.loop_mode
         if loop_mode == "auto":
             loop_mode = "asyncio" if ("debugpy" in sys.modules) else "thread"
-        print(f"[Bridge] Starting on ws://{args.host}:{args.port}/attendee-websocket engine={args.engine} sr={args.sample_rate} frame_ms={args.frame_ms} pace={not args.no_pace} greet={not args.no_greet} monitor={args.monitor_input} loop_mode={loop_mode} bot_beep_on_connect={args.bot_beep_on_connect} bot_tone_hz={args.bot_tone_hz}")
+        print(f"[Bridge] Starting on ws://{args.host}:{args.port}/attendee-websocket engine={args.engine} sr={args.sample_rate} frame_ms={args.frame_ms} pace={not args.no_pace} greet={not args.no_greet} monitor={args.monitor_input} loop_mode={loop_mode} bot_beep_on_connect={args.bot_beep_on_connect} bot_tone_hz={args.bot_tone_hz} log_latency={args.log_latency}")
         if args.monitor_input:
             print("[Bridge:Monitor] Startup device check + test tone...")
             # _monitor_device_and_beep(args.sample_rate)
