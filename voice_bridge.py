@@ -20,7 +20,7 @@ import math
 import os
 import time
 from io import BytesIO
-from typing import Any, Optional
+from typing import Any, Optional, cast
 import threading
 import sys
 
@@ -31,6 +31,31 @@ from dotenv import load_dotenv
 from elevenlabs import VoiceSettings  # type: ignore
 from elevenlabs.client import ElevenLabs  # type: ignore
 # Avoid importing the full bot or heavy Pipecat stacks here to prevent side effects
+
+# Pipecat imports (used when --engine=pipecat)
+try:
+    from pipecat.frames.frames import (
+        InputAudioRawFrame,
+        OutputAudioRawFrame,
+        TTSAudioRawFrame,
+        SpeechOutputAudioRawFrame,
+        StartFrame,
+        LLMRunFrame,
+    )
+    from pipecat.pipeline.pipeline import Pipeline
+    from pipecat.pipeline.runner import PipelineRunner
+    from pipecat.pipeline.task import PipelineParams, PipelineTask
+    from pipecat.processors.frameworks.rtvi import RTVIConfig, RTVIObserver, RTVIProcessor
+    from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+    from pipecat.services.soniox.stt import SonioxSTTService, SonioxInputParams
+    from pipecat.transcriptions.language import Language
+    from pipecat.services.openai.llm import OpenAILLMService
+    from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
+    from pipecat.processors.frame_processor import FrameProcessor
+    from pipecat.transports.base_transport import BaseTransport
+    _HAS_PIPECAT = True
+except Exception:
+    _HAS_PIPECAT = False
 
 # Optional local audio monitoring for debugging
 try:
@@ -221,10 +246,12 @@ class PipecatStackEngine:
                 print("[Pipecat] STT returned empty text")
                 return b"", self.sample_rate
             print(f"[Pipecat] STT: {text}")
-            # 2) LLM with Spanish system prompt
+            # 2) LLM with Spanish system prompt (aligned with bot persona)
             system_prompt = (
-                "Eres Gonzalo, un vendedor amable de TEOS. Hablas en español con acentuación correcta. "
-                "Responde breve y conversacional, sin listas ni emojis."
+                "Eres Gonzalo, un vendedor amable de TEOS. SOLO RESPONDES EN ESPAÑOL con acentuación correcta. "
+                "Habla de forma breve y conversacional (sin listas, ni emojis, ni indicaciones escénicas). "
+                "Saluda usando el nombre del prospecto 'Julián' al inicio de la conversación. "
+                "Haz una sola pregunta por turno y mantén un tono cercano."
             )
             reply = _openai_chat_complete([
                 {"role": "system", "content": system_prompt},
@@ -237,6 +264,210 @@ class PipecatStackEngine:
         except Exception as e:
             print(f"[Pipecat] Pipeline error: {e}")
             return b"", self.sample_rate
+
+
+# Exact-pipeline transport and engine using Pipecat (parity with bot.py)
+if _HAS_PIPECAT:
+    class _AttendeeInputProcessor(FrameProcessor):
+        def __init__(self, *, name: Optional[str] = None) -> None:
+            super().__init__(name=name)
+            self._started_event: asyncio.Event = asyncio.Event()
+
+        async def process_frame(self, frame: Any, direction: Any) -> None:
+            await super().process_frame(frame, direction)
+            if isinstance(frame, StartFrame):
+                try:
+                    self._started_event.set()
+                except Exception:
+                    pass
+            # Transparently forward all frames downstream
+            try:
+                await self.push_frame(frame, direction)
+            except Exception:
+                pass
+
+        async def wait_started(self) -> None:
+            await self._started_event.wait()
+
+    class _AttendeeOutputProcessor(FrameProcessor):
+        def __init__(self, sender_cb: Any, started_event: asyncio.Event, *, name: Optional[str] = None) -> None:
+            super().__init__(name=name)
+            self._sender_cb = sender_cb
+            self._started_event = started_event
+
+        async def process_frame(self, frame: Any, direction: Any) -> None:
+            await super().process_frame(frame, direction)
+            try:
+                if isinstance(frame, StartFrame):
+                    try:
+                        self._started_event.set()
+                    except Exception:
+                        pass
+                if isinstance(frame, (OutputAudioRawFrame, TTSAudioRawFrame, SpeechOutputAudioRawFrame)):
+                    # Send PCM bytes back via provided callback
+                    if callable(self._sender_cb):
+                        await self._sender_cb(frame.audio, frame.sample_rate)
+            except Exception as e:
+                print(f"[PipecatTransport] Output send error: {e}")
+            # Transparently forward all frames downstream
+            try:
+                await self.push_frame(frame, direction)
+            except Exception:
+                pass
+
+    class AttendeeBridgeTransport(BaseTransport):
+        def __init__(self) -> None:
+            super().__init__(name="AttendeeBridgeTransport")
+            self._sender_cb: Any = None
+            self._input_proc = _AttendeeInputProcessor(name="attendee-input")
+            self._pipeline_started: asyncio.Event = asyncio.Event()
+            self._output_proc = _AttendeeOutputProcessor(self._send_out, self._pipeline_started, name="attendee-output")
+            self._buffer: list[tuple[bytes, int, int]] = []
+
+        def input(self) -> FrameProcessor:
+            return self._input_proc
+
+        def output(self) -> FrameProcessor:
+            return self._output_proc
+
+        def set_sender(self, sender_cb: Any) -> None:
+            self._sender_cb = sender_cb
+
+        async def _send_out(self, audio: bytes, sample_rate: int) -> None:
+            if callable(self._sender_cb):
+                await self._sender_cb(audio, sample_rate)
+
+        async def feed_pcm(self, pcm: bytes, sample_rate: int, num_channels: int = 1) -> None:
+            if not self._pipeline_started.is_set():
+                # Buffer until StartFrame has reached output
+                self._buffer.append((pcm, sample_rate, num_channels))
+                return
+            frame = InputAudioRawFrame(audio=pcm, sample_rate=sample_rate, num_channels=num_channels)
+            await self._input_proc.push_frame(frame)
+
+        async def wait_started(self) -> None:
+            await self._input_proc.wait_started()
+
+        async def wait_pipeline_started(self) -> None:
+            await self._pipeline_started.wait()
+
+        async def flush_buffer(self) -> None:
+            if not self._buffer:
+                return
+            queued = self._buffer
+            self._buffer = []
+            for pcm, sr, ch in queued:
+                frame = InputAudioRawFrame(audio=pcm, sample_rate=sr, num_channels=ch)
+                await self._input_proc.push_frame(frame)
+
+    class PipecatPipelineEngine:
+        def __init__(self, sample_rate: int) -> None:
+            self.sample_rate = sample_rate
+            self.transport = AttendeeBridgeTransport()
+            self._runner: Any = None
+            self._task: Any = None
+            # Persona/context matching bot.py
+            try:
+                from bot import sys as BOT_SYSTEM_PROMPT  # type: ignore
+                self._system_prompt = BOT_SYSTEM_PROMPT
+            except Exception:
+                self._system_prompt = (
+                    "You are Gonzalo, the friendly salesman in charge of TEOS. "
+                    "ONLY ANSWER IN SPANISH with correct accentuation. Keep responses short, no lists/emojis." 
+                    "Greet the prospect using the name 'Julián' to start."
+                )
+
+        async def start(self) -> None:
+            # Services mirror bot.py
+            stt = SonioxSTTService(
+                api_key=os.getenv("SONIOX_API_KEY") or "",
+                params=SonioxInputParams(language_hints=[Language.EN, Language.ES]),
+            )
+            llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4.1")
+            _el_api_key = cast(str, os.getenv("ELEVENLABS_API_KEY") or "")
+            _el_voice_id = cast(str, os.getenv("ELEVENLABS_VOICE_ID") or "")
+            tts = ElevenLabsTTSService(
+                api_key=_el_api_key,
+                voice_id=_el_voice_id,
+                model="eleven_multilingual_v2",
+                params=ElevenLabsTTSService.InputParams(
+                    language=Language.ES,
+                    stability=0.7,
+                    similarity_boost=0.8,
+                    style=0.5,
+                    use_speaker_boost=True,
+                    speed=1.0,
+                ),
+            )
+
+            messages: Any = [
+                {"role": "system", "content": self._system_prompt},
+            ]
+            context = OpenAILLMContext(messages)
+            context_agg = llm.create_context_aggregator(context)
+
+            rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
+
+            pipeline = Pipeline(
+                [
+                    self.transport.input(),
+                    rtvi,
+                    stt,
+                    context_agg.user(),
+                    llm,
+                    tts,
+                    self.transport.output(),
+                    context_agg.assistant(),
+                ]
+            )
+
+            self._task = PipelineTask(
+                pipeline,
+                params=PipelineParams(
+                    enable_metrics=True,
+                    enable_usage_metrics=True,
+                ),
+                observers=[RTVIObserver(rtvi)],
+            )
+            self._runner = PipelineRunner(handle_sigint=False)
+            # Run in background
+            asyncio.create_task(self._runner.run(self._task))
+            # Wait for StartFrame to propagate so we can feed audio safely
+            try:
+                await self.transport.wait_started()
+            except Exception:
+                pass
+            # Also wait for StartFrame to reach the output end
+            try:
+                await self.transport.wait_pipeline_started()
+            except Exception:
+                pass
+            # Flush any buffered input
+            try:
+                await self.transport.flush_buffer()
+            except Exception:
+                pass
+
+        async def stop(self) -> None:
+            try:
+                if self._task is not None:
+                    await self._task.cancel()
+            except Exception:
+                pass
+
+        async def on_client_connected(self) -> None:
+            # Kick off greeting
+            try:
+                if self._task is not None:
+                    await self._task.queue_frames([LLMRunFrame()])
+            except Exception as e:
+                print(f"[Pipecat] on_client_connected error: {e}")
+
+        async def on_audio_chunk(self, pcm: bytes, sample_rate: int) -> None:
+            try:
+                await self.transport.feed_pcm(pcm, sample_rate)
+            except Exception as e:
+                print(f"[Pipecat] feed error: {e}")
 
 def _monitor_device_and_beep(sample_rate: int) -> None:
     if not sa:
@@ -324,16 +555,19 @@ class VoiceBridgeServer:
                 dtype='int16',
                 blocksize=0,
             )
-            self._sd_stream.start()
-            self._sd_stream_rate = samplerate
+            stream = self._sd_stream
+            if stream is not None:
+                stream.start()
+                self._sd_stream_rate = samplerate
             print(f"[Bridge:Monitor] sounddevice stream opened @ {samplerate} Hz")
             return True
         except Exception as e:
             print(f"[Bridge:Monitor] sounddevice open failed: {e}")
             try:
-                if self._sd_stream is not None:
-                    self._sd_stream.stop()
-                    self._sd_stream.close()
+                stream3 = self._sd_stream
+                if stream3 is not None:
+                    stream3.stop()
+                    stream3.close()
             except Exception:
                 pass
             self._sd_stream = None
@@ -365,17 +599,29 @@ class VoiceBridgeServer:
         # Start continuous tone loop if configured
         if self.bot_tone_hz > 0 and self._tone_task is None:
             self._tone_task = asyncio.create_task(self._tone_loop(ws))
-        # Proactively greet on connect to ensure audio output even without incoming audio
-        if self.greet_enabled and not self.responded_once and hasattr(self.engine, "tts_pcm"):
+        # If using the exact Pipecat pipeline, hook sender and start runner
+        if _HAS_PIPECAT and isinstance(self.engine, PipecatPipelineEngine):
             try:
-                text = "[cheerfully] Hola Julián, soy Gonzalo de TEOS. ¿Cómo estás?"
-                pcm, sr = await self.engine.tts_pcm(text)  # type: ignore[attr-defined]
-                await self._send_pcm(ws, pcm, sr)
-                self.responded_once = True
+                async def sender_cb(pcm: bytes, sr: int) -> None:
+                    await self._send_pcm(ws, pcm, sr)
+                self.engine.transport.set_sender(sender_cb)
+                await self.engine.start()
+                if self.greet_enabled:
+                    await self.engine.on_client_connected()
             except Exception as e:
-                print(f"[Bridge] Initial greet failed: {e}")
-        elif self.greet_enabled and not hasattr(self.engine, "tts_pcm"):
-            print("[Bridge] Greeting skipped: current engine has no tts_pcm")
+                print(f"[Bridge] Pipecat start error: {e}")
+        else:
+            # Proactively greet on connect to ensure audio output even without incoming audio
+            if self.greet_enabled and not self.responded_once and hasattr(self.engine, "tts_pcm"):
+                try:
+                    text = "[cheerfully] Hola Julián, soy Gonzalo de TEOS. ¿Cómo estás?"
+                    pcm, sr = await self.engine.tts_pcm(text)  # type: ignore[attr-defined]
+                    await self._send_pcm(ws, pcm, sr)
+                    self.responded_once = True
+                except Exception as e:
+                    print(f"[Bridge] Initial greet failed: {e}")
+            elif self.greet_enabled and not hasattr(self.engine, "tts_pcm"):
+                print("[Bridge] Greeting skipped: current engine has no tts_pcm")
 
         try:
             async for message in ws:
@@ -410,6 +656,13 @@ class VoiceBridgeServer:
                         else:
                             print(f"[Bridge] Receiving audio: chunks={self._chunks_received} total={self._bytes_received}B ~{seconds:.2f}s @ {in_sr} Hz")
                     self._in_pcm.extend(chunk)
+                    # If using Pipecat pipeline, feed audio continuously and skip ad-hoc trigger
+                    if _HAS_PIPECAT and isinstance(self.engine, PipecatPipelineEngine):
+                        try:
+                            await self.engine.on_audio_chunk(chunk, in_sr)
+                        except Exception as e:
+                            print(f"[Bridge] Pipecat feed error: {e}")
+                        continue
                     # Optional: play back what the bot is hearing (local monitoring)
                     if self.monitor_input:
                         # Prefer sounddevice stream if available
@@ -418,12 +671,16 @@ class VoiceBridgeServer:
                                 # Ensure even number of bytes
                                 if len(chunk) % 2 != 0:
                                     chunk = chunk[:-1]
-                                self._sd_stream.write(chunk)
+                                stream = self._sd_stream
+                                if stream is not None:
+                                    stream.write(chunk)
                             except Exception as e:
                                 print(f"[Bridge:Monitor] sd write failed: {e}")
                                 try:
-                                    self._sd_stream.stop()
-                                    self._sd_stream.close()
+                                    stream2 = self._sd_stream
+                                    if stream2 is not None:
+                                        stream2.stop()
+                                        stream2.close()
                                 except Exception:
                                     pass
                                 self._sd_stream = None
@@ -447,7 +704,7 @@ class VoiceBridgeServer:
                             if out_pcm:
                                 await self._send_pcm(ws, out_pcm, out_sr)
                         else:
-                            text = "[cheerfully] Hola Julián, soy Gonzalo de TEOS. ¿Cómo estás? aguanten los sanguches, mi nombre es gabriel, abud, abud, abud, nazi"
+                            text = "[cheerfully] Hola Julián, soy Gonzalo de TEOS. ¿Cómo estás?"
                             pcm, sr = await self.engine.tts_pcm(text)
                             await self._send_pcm(ws, pcm, sr)
                     except Exception as e:
@@ -464,13 +721,20 @@ class VoiceBridgeServer:
                 pass
             # Close sounddevice stream if open
             try:
-                if self._sd_stream is not None:
-                    self._sd_stream.stop()
-                    self._sd_stream.close()
+                stream4 = self._sd_stream
+                if stream4 is not None:
+                    stream4.stop()
+                    stream4.close()
             except Exception:
                 pass
             self._sd_stream = None
             self._sd_stream_rate = None
+            # Stop Pipecat pipeline if running
+            try:
+                if _HAS_PIPECAT and isinstance(self.engine, PipecatPipelineEngine):
+                    await self.engine.stop()
+            except Exception:
+                pass
 
     async def _send_pcm(self, ws: Any, pcm: bytes, sample_rate: int) -> None:
         frame_samples = int(sample_rate * (self.frame_ms / 1000.0))
@@ -557,10 +821,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         parser.add_argument("--log-latency", action="store_true", help="Log arrival latency vs Attendee timestamp_ms to diagnose delay sources")
         args = parser.parse_args(argv)
 
+        engine: Any
         if args.engine == "elevenlabs":
             engine = ElevenLabsEngine(args.sample_rate)
         elif args.engine == "pipecat":
-            engine = PipecatStackEngine(args.sample_rate)
+            engine = PipecatPipelineEngine(args.sample_rate) if _HAS_PIPECAT else PipecatStackEngine(args.sample_rate)
         else:
             raise SystemExit("Unsupported engine")
 
