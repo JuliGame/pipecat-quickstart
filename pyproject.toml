@@ -5,7 +5,9 @@ description = "Quickstart example for building voice AI bots with Pipecat"
 requires-python = ">=3.10"
 dependencies = [
     "pipecat-ai[webrtc,silero,deepgram,openai,cartesia,runner,soniox,elevenlabs]>=0.0.83",
-    "pipecatcloud>=0.2.4"
+    "pipecatcloud>=0.2.4",
+    "websockets>=12.0",
+    "elevenlabs>=1.6.0"
 ]
 
 [dependency-groups]
