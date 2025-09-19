@@ -104,7 +104,8 @@ def create_attendee_bot(meeting_url: str, bot_name: str, api_key: str, sample_ra
             #     }
             # },
             "voice_agent_settings": {
-                "url": "https://constantly-adjusted-pheasant.ngrok-free.app/client/"
+                # "url": "https://constantly-adjusted-pheasant.ngrok-free.app/client/"
+                "url": "https://attendee.dev/vapi_voice_agent_example?public_key=d53e5282-86ad-4bfd-9439-0deae99e7afb&assistant_id=e75bbb12-1f9b-407e-8d49-2aca6db1536f"
             }
         },
     )
