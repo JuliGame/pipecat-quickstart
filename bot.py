@@ -30,7 +30,7 @@ print("🚀 Starting Pipecat bot...")
 print("⏳ Loading models and imports (20 seconds first run only)\n")
 
 logger.info("Loading Silero VAD model...")
-from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.silero import SileroVADAnalyzer, VADParams
 
 logger.info("✅ Silero VAD model loaded")
 logger.info("Loading pipeline components...")
@@ -47,6 +47,8 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.services.soniox.stt import SonioxSTTService, SonioxInputParams
 from pipecat.transcriptions.language import Language
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
+from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 
 logger.info("✅ All components loaded successfully!")
 
@@ -185,7 +187,14 @@ async def bot(runner_args: RunnerArguments):
         "webrtc": lambda: TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(),
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
+            turn_analyzer=LocalSmartTurnAnalyzerV3(
+                params=SmartTurnParams(
+                    stop_secs=3.0,
+                    pre_speech_ms=0.0,
+                    max_duration_secs=8.0,
+                )
+            ),
         ),
     }
 
