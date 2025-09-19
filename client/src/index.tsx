@@ -5,7 +5,7 @@ import {
   ThemeProvider,
 } from '@pipecat-ai/voice-ui-kit';
 import { usePipecatClient } from '@pipecat-ai/client-react';
-import { StrictMode, useEffect, useRef } from 'react';
+import { StrictMode, useEffect } from 'react';
 import { createRoot } from 'react-dom/client';
 
 //@ts-ignore - fontsource-variable/geist is not typed
