@@ -204,6 +204,76 @@ async def bot(runner_args: RunnerArguments):
 
 
 if __name__ == "__main__":
+    # If a local client build exists, override the prebuilt UI the runner mounts at /client
+    try:
+        import sys as _sys
+        import os as _os
+        from types import ModuleType as _ModuleType
+        try:
+            from fastapi.staticfiles import StaticFiles as _StaticFiles  # type: ignore
+        except Exception as _e:
+            _StaticFiles = None  # type: ignore
+
+        _default_client_dir = _os.path.join(_os.path.dirname(__file__), "client", "dist")
+        _client_dir = _os.getenv("WEB_CLIENT_DIR") or _default_client_dir
+        if _StaticFiles is not None and _os.path.isdir(_client_dir):
+            _frontend_mod = _ModuleType("pipecat_ai_small_webrtc_prebuilt.frontend")
+            setattr(_frontend_mod, "SmallWebRTCPrebuiltUI", _StaticFiles(directory=_client_dir, html=True))
+            _sys.modules["pipecat_ai_small_webrtc_prebuilt.frontend"] = _frontend_mod
+            logger.info(f"Serving local client at /client from: {_client_dir}")
+        else:
+            if not _os.path.isdir(_client_dir):
+                logger.warning(f"Local client not found at {_client_dir}. Using prebuilt UI. Set WEB_CLIENT_DIR to override.")
+    except Exception as _e:
+        logger.warning(f"Failed to enable local client override: {_e}")
+
+    # Optionally launch ngrok with a reserved URL before starting the dev runner.
+    # Default reserved domain can be overridden via NGROK_URL env var.
+    try:
+        import subprocess  # noqa: F401
+        import atexit  # noqa: F401
+        import shutil as _shutil  # noqa: F401
+
+        _reserved_url = os.getenv("NGROK_URL") or "constantly-adjusted-pheasant.ngrok-free.app"
+        # Derive port from CLI args if provided, else default to 7860
+        _port = 7860
+        try:
+            if "--port" in _sys.argv:
+                _idx = _sys.argv.index("--port")
+                if _idx + 1 < len(_sys.argv):
+                    _port = int(_sys.argv[_idx + 1])
+        except Exception:
+            _port = 7860
+
+        _ngrok_proc = None
+        if _shutil.which("ngrok") is not None and _reserved_url:
+            try:
+                _cmd = [
+                    "ngrok",
+                    "http",
+                    f"--url={_reserved_url}",
+                    str(_port),
+                ]
+                logger.info(f"Starting ngrok tunnel: {' '.join(_cmd)}")
+                _ngrok_proc = subprocess.Popen(_cmd)
+
+                def _cleanup_ngrok() -> None:
+                    try:
+                        if _ngrok_proc and _ngrok_proc.poll() is None:
+                            _ngrok_proc.terminate()
+                    except Exception:
+                        pass
+
+                atexit.register(_cleanup_ngrok)
+            except Exception as _e:
+                logger.warning(f"Failed to start ngrok: {_e}")
+        else:
+            if _reserved_url:
+                logger.warning("ngrok not found on PATH. Skipping tunnel startup.")
+    except Exception:
+        # Non-fatal if ngrok setup fails; continue starting the runner
+        pass
+
     from pipecat.runner.run import main
 
     main()

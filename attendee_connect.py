@@ -96,13 +96,16 @@ def create_attendee_bot(meeting_url: str, bot_name: str, api_key: str, sample_ra
             "recording_settings": {"format": "none"},
             # Configure realtime audio websocket per Attendee docs
             # https://docs.attendee.dev/guides/realtime-audio-input-and-output
-            "websocket_settings": {
-                "audio": {
-                    # For Docker on Windows, Attendee container can reach host via host.docker.internal
-                    "url": "ws://host.docker.internal:8765/attendee-websocket",
-                    "sample_rate": sample_rate,
-                }
-            },
+            # "websocket_settings": {
+            #     "audio": {
+            #         # For Docker on Windows, Attendee container can reach host via host.docker.internal
+            #         "url": "",
+            #         "sample_rate": sample_rate,
+            #     }
+            # },
+            "voice_agent_settings": {
+                "url": "https://constantly-adjusted-pheasant.ngrok-free.app/client/"
+            }
         },
     )
     if status not in (200, 201):
