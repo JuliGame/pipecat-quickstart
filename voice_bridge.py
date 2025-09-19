@@ -300,174 +300,123 @@ class PipecatPipelineEngine:
 
         rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
 
-        class _SmartTurnEmulator(FrameProcessor):
+        class _TurnBySTTFinal(FrameProcessor):
             def __init__(self, stop_secs: float = 0.8, *, name: Optional[str] = None) -> None:
                 super().__init__(name=name)
                 self._stop_secs = float(max(0.2, stop_secs))
                 self._last_activity: float | None = None
+                self._awaiting_reply: bool = False
                 self._watch_task: Any | None = None
-                self._speaking = False
-
-            async def process_frame(self, frame: Any, direction: Any) -> None:
-                await super().process_frame(frame, direction)
-                try:
-                    # Forward original frame downstream
-                    await self.push_frame(frame, direction)
-                except Exception:
-                    pass
-                try:
-                    # Start watchdog when pipeline starts
-                    if isinstance(frame, StartFrame) and self._watch_task is None:
-                        self._watch_task = self.create_task(self._watchdog(), name="smartturn-watchdog")
-                        print(f"[PipecatDebug] SmartTurn: watchdog started stop_secs={self._stop_secs}")
-                    # Track interim transcription activity
-                    if isinstance(frame, InterimTranscriptionFrame):
-                        text = str(getattr(frame, "text", "") or "").strip()
-                        is_final = bool(getattr(frame, "is_final", False) or getattr(frame, "final", False))
-                        now = time.monotonic()
-                        if text:
-                            self._last_activity = now
-                            self._speaking = True
-                        if is_final and text:
-                            # If the STT marks final explicitly, trigger immediately
-                            await self.push_frame(LLMRunFrame())
-                            self._speaking = False
-                            self._last_activity = None
-                except Exception:
-                    pass
 
             async def _watchdog(self) -> None:
                 try:
                     while True:
                         await asyncio.sleep(0.05)
-                        if self._speaking and self._last_activity is not None:
+                        if not self._awaiting_reply and self._last_activity is not None:
                             elapsed = time.monotonic() - self._last_activity
                             if elapsed >= self._stop_secs:
                                 try:
                                     await self.push_frame(LLMRunFrame())
                                 except Exception:
                                     pass
-                                self._speaking = False
+                                self._awaiting_reply = True
                                 self._last_activity = None
                 except asyncio.CancelledError:
                     return
 
-        smart_turn = _SmartTurnEmulator(stop_secs=0.8, name="smart-turn")
+            async def process_frame(self, frame: Any, direction: Any) -> None:
+                await super().process_frame(frame, direction)
+                # Always forward
+                try:
+                    await self.push_frame(frame, direction)
+                except Exception:
+                    pass
+                try:
+                    # Start watchdog once pipeline starts
+                    if isinstance(frame, StartFrame) and self._watch_task is None:
+                        self._watch_task = self.create_task(self._watchdog(), name="turn-by-stt-final-watchdog")
+                    # Observe TTS end to open next user turn
+                    if isinstance(frame, TTSStoppedFrame):
+                        self._awaiting_reply = False
+                    # Track STT activity and trigger on finals
+                    if isinstance(frame, InterimTranscriptionFrame):
+                        text = str(getattr(frame, "text", "") or "").strip()
+                        is_final = bool(getattr(frame, "is_final", False) or getattr(frame, "final", False))
+                        if text:
+                            self._last_activity = time.monotonic()
+                        if is_final and text and not self._awaiting_reply:
+                            await self.push_frame(LLMRunFrame())
+                            self._awaiting_reply = True
+                            self._last_activity = None
+                except Exception:
+                    pass
+
+        turn_by_stt_final = _TurnBySTTFinal(stop_secs=0.8, name="turn-by-stt-final")
 
         class _LLMToTTSSpeak(FrameProcessor):
             def __init__(self, *, name: Optional[str] = None) -> None:
                 super().__init__(name=name)
                 self._buffer: str = ""
                 self._debounce: Any | None = None
-                self._emitted_in_run: bool = False
 
-            async def _finalize_and_speak(self) -> None:
-                try:
-                    text = self._buffer.strip()
-                    self._buffer = ""
-                    if text and not self._emitted_in_run:
-                        print(f"[PipecatDebug] LLM→TTS: finalized len={len(text)}")
-                        try:
-                            print(f"[PipecatDebug] LLM→TTS: finalized text: {text}")
-                        except Exception:
-                            pass
-                        await self.push_frame(TTSSpeakFrame(text))
-                        self._emitted_in_run = True
-                except Exception:
-                    pass
+            async def _flush(self) -> None:
+                text = self._buffer.strip()
+                self._buffer = ""
+                if text:
+                    await self.push_frame(TTSSpeakFrame(text))
+
             async def process_frame(self, frame: Any, direction: Any) -> None:
                 await super().process_frame(frame, direction)
-                # Forward original frame
+                # forward original
                 try:
                     await self.push_frame(frame, direction)
                 except Exception:
                     pass
-                # Bridge plain LLM text to TTS speak
                 try:
-                    fname = type(frame).__name__
-                    # Reset run state on new LLM run
                     if isinstance(frame, LLMRunFrame):
-                        try:
-                            print("[PipecatDebug] LLM→TTS: new LLM run")
-                        except Exception:
-                            pass
-                        try:
-                            if self._debounce is not None:
+                        if self._debounce is not None:
+                            try:
                                 self._debounce.cancel()
-                        except Exception:
-                            pass
+                            except Exception:
+                                pass
                         self._buffer = ""
-                        self._emitted_in_run = False
                         return
-
-                    # Accumulate streaming deltas, then speak once after a brief pause
                     if isinstance(frame, LLMTextFrame):
                         delta = str(getattr(frame, "text", "") or "")
                         if delta:
-                            print(f"[PipecatDebug] LLM→TTS: delta len={len(delta)}")
-                            try:
-                                print(f"[PipecatDebug] LLM→TTS: delta text: {delta}")
-                            except Exception:
-                                pass
-                            # If starting a new chunk sequence, allow a new emission
-                            if not self._buffer:
-                                self._emitted_in_run = False
                             self._buffer += delta
-                            # debounce finalize
-                            try:
-                                if self._debounce is not None:
+                            if self._debounce is not None:
+                                try:
                                     self._debounce.cancel()
-                            except Exception:
-                                pass
-                            try:
-                                async def _debounced() -> None:
-                                    try:
-                                        await asyncio.sleep(0.25)
-                                        await self._finalize_and_speak()
-                                    except asyncio.CancelledError:
-                                        return
-                                self._debounce = asyncio.create_task(_debounced())
-                            except Exception:
-                                pass
+                                except Exception:
+                                    pass
+                            async def _debounced() -> None:
+                                try:
+                                    await asyncio.sleep(0.25)
+                                    await self._flush()
+                                except asyncio.CancelledError:
+                                    return
+                            self._debounce = asyncio.create_task(_debounced())
                         return
-
-                    # Do not trigger TTS on non-final tokens beyond the accumulator
-                    # Some LLMs may emit message frames instead of LLMTextFrame
-                    # Try to extract assistant text from LLMMessages* frames
+                    fname = type(frame).__name__
                     if fname in ("LLMMessagesFrame", "LLMMessagesAppendFrame", "LLMMessagesUpdateFrame"):
                         messages = getattr(frame, "messages", None)
                         if isinstance(messages, (list, tuple)) and messages:
-                            # Find last assistant content
                             for m in reversed(messages):
                                 role = (m.get("role") if isinstance(m, dict) else None) or ""
                                 content = m.get("content") if isinstance(m, dict) else None
                                 if role == "assistant" and isinstance(content, str) and content.strip():
-                                    print(f"[PipecatDebug] LLM→TTS: assistant message len={len(content.strip())}")
-                                    # Cancel pending debounce and flush buffer
-                                    try:
-                                        if self._debounce is not None:
+                                    if self._debounce is not None:
+                                        try:
                                             self._debounce.cancel()
-                                    except Exception:
-                                        pass
-                                    if not self._emitted_in_run:
-                                        if self._buffer.strip():
-                                            try:
-                                                merged = (self._buffer + " " + content.strip()).strip()
-                                                self._buffer = merged
-                                                print(f"[PipecatDebug] LLM→TTS: merged final text: {merged}")
-                                            except Exception:
-                                                self._buffer += " " + content.strip()
-                                            await self._finalize_and_speak()
-                                        else:
-                                            final_text = content.strip()
-                                            try:
-                                                print(f"[PipecatDebug] LLM→TTS: assistant final text: {final_text}")
-                                            except Exception:
-                                                pass
-                                            await self.push_frame(TTSSpeakFrame(final_text))
-                                        self._emitted_in_run = True
+                                        except Exception:
+                                            pass
+                                    if self._buffer.strip():
+                                        self._buffer = (self._buffer + " " + content.strip()).strip()
+                                        await self._flush()
+                                    else:
+                                        await self.push_frame(TTSSpeakFrame(content.strip()))
                                     break
-                    # Fallback: ignore non-final frames to avoid spamming TTS
                 except Exception:
                     pass
 
@@ -478,7 +427,7 @@ class PipecatPipelineEngine:
                 self.transport.input(),
                 rtvi,
                 stt,
-                smart_turn,
+                turn_by_stt_final,
                 context_agg.user(),
                 llm,
                 llm_to_tts,
